@@ -7,123 +7,65 @@
  */
 
 #include <znc/Modules.h>
-#include <iconv.h>
+#include <unicode/ucsdet.h>
+#include <unicode/ucnv.h>
 
-#ifndef ICONV_CONST
-/* configure is supposed to define this, depending on whether the second
-	argument to iconv is const char** or just char**, but if it isn't defined,
-	we default to GNU/Linux which is non-const. */
-#define ICONV_CONST
-#endif
+#define CONVERT_BUFFER_LEN UCNV_GET_MAX_BYTES_FOR_STRING(512, 4) // sufficient for the maximum RFC2812 message length in pure Unicode
 
 class CCharsetMod : public CModule
 {
 private:
 	VCString m_vsClientCharsets;
 	VCString m_vsServerCharsets;
-	bool m_bForce; // don't check whether the input string is already a
-	// valid string in the target charset. Instead, always apply conversion.
+	bool m_bGuess; // try to guess source charsets before applying specified ones
+	bool m_bOnlyServer; // only convert messages from server to client
 
-	size_t GetConversionLength(iconv_t& ic, const CString& sData)
+	UCharsetDetector *m_pCharsetDetector;
+
+	bool GuessCharsets(const CString& sData, VCString &charsets)
 	{
-		if(sData.empty()) return 0;
+		UErrorCode uErr = U_ZERO_ERROR;
+		ucsdet_setText(m_pCharsetDetector, sData.data(), sData.size(), &uErr);
 
-		size_t uLength = 0;
-		char tmpbuf[1024];
-		const char *pIn = sData.c_str();
-		size_t uInLen = sData.size();
-		bool bBreak;
-
-		do
+		if(U_SUCCESS(uErr))
 		{
-			char *pOut = tmpbuf;
-			size_t uBufSize = 1024;
-			bBreak = (uInLen < 1);
+			uErr = U_ZERO_ERROR;
+			int nMatches;
+			const UCharsetMatch **matches = ucsdet_detectAll(m_pCharsetDetector, &nMatches, &uErr);
 
-			if(iconv(ic, // this is ugly, but keeps the code short:
-				(uInLen < 1 ? NULL : (ICONV_CONST char**)&pIn),
-				(uInLen < 1 ? NULL : &uInLen),
-				&pOut, &uBufSize) == (size_t)-1)
-				// explanation: iconv needs a last call with input = NULL to
-				// copy/convert possibly left data chunks into the output buffer.
+			if(U_SUCCESS(uErr))
 			{
-				if(errno == EINVAL)
+				uErr = U_ZERO_ERROR;
+				int i;
+
+				for(i = 0; i < nMatches; ++i)
 				{
-					// charset is not what we think it is.
-					return (size_t)-1;
+					charsets.insert(charsets.end(), ucsdet_getName(matches[i], &uErr));
 				}
-				else if(errno != E2BIG)
-				{
-					// something bad happened, internal error.
-					return (size_t)-2;
-				}
+
+				return true;
 			}
+		}
 
-			uLength += (pOut - tmpbuf);
-		} while(!bBreak);
-
-		return uLength;
+		return false;
 	}
 
 	bool ConvertCharset(const CString& sFrom, const CString& sTo, CString& sData)
 	{
-		if(sData.empty()) return true;
+		int nBytes;
+		UErrorCode uErr = U_ZERO_ERROR;
+		char buf[CONVERT_BUFFER_LEN] = {0};
 
-		DEBUG("charset: Trying to convert [" + sData.Escape_n(CString::EURL) + "] from [" + sFrom + "] to [" + sTo + "]...");
+		nBytes = ucnv_convert(sTo.c_str(), sFrom.c_str(), buf, CONVERT_BUFFER_LEN, sData.data(), sData.size(), &uErr);
 
-		iconv_t ic = iconv_open(sTo.c_str(), sFrom.c_str());
-		if(ic == (iconv_t)-1) return false;
-
-		size_t uLength = GetConversionLength(ic, sData);
-
-		if(uLength == (size_t)-1)
+		if(U_FAILURE(uErr) && uErr != U_BUFFER_OVERFLOW_ERROR)
 		{
-			// incompatible input encoding.
-			iconv_close(ic);
-			return false;
-		}
-		else if(uLength == (size_t)-2)
-		{
-			// internal error, preserve errno from GetConversionLength:
-			int tmp_errno = errno;
-			iconv_close(ic);
-			errno = tmp_errno;
 			return false;
 		}
 		else
 		{
-			// no error, so let's do the actual conversion.
-
-			iconv(ic, NULL, NULL, NULL, NULL); // reset
-
-			// state vars for iconv:
-			size_t uResultBufSize = uLength + 1;
-			char *pResult = new char[uResultBufSize];
-			memset(pResult, 0, uResultBufSize);
-			char *pResultWalker = pResult;
-			const char* pIn = sData.c_str();
-			size_t uInLen = sData.size();
-
-			// let's fcking do it!
-			size_t uResult = iconv(ic, (ICONV_CONST char**)&pIn, &uInLen, &pResultWalker, &uResultBufSize);
-			bool bResult = (uResult != (size_t)-1);
-
-			iconv_close(ic);
-
-			if(bResult)
-			{
-				sData.assign(pResult, uLength);
-
-				DEBUG("charset: Converted: [" + sData.Escape_n(CString::EURL) + "] from [" + sFrom + "] to [" + sTo + "]!");
-			}
-			else
-			{
-				DEBUG("Conversion failed: [" << uResult << "]");
-			}
-
-			delete[] pResult;
-
-			return bResult;
+			sData.assign(buf, nBytes);
+			return true;
 		}
 	}
 
@@ -131,27 +73,18 @@ private:
 	{
 		CString sDataCopy(sData);
 
-		if(!m_bForce)
-		{
-			// check whether sData already is encoded with the right charset:
-			iconv_t icTest = iconv_open(sTo.c_str(), sTo.c_str());
-			if(icTest != (iconv_t)-1)
-			{
-				size_t uTest = GetConversionLength(icTest, sData);
-				iconv_close(icTest);
+		bool bConverted = false;
+		VCString srcCharsets;
 
-				if(uTest != (size_t)-1 && uTest != (size_t)-2)
-				{
-					DEBUG("charset: [" + sData.Escape_n(CString::EURL) + "] is valid [" + sTo + "] already.");
-					return true;
-				}
-			}
+		if(m_bGuess)
+		{
+			GuessCharsets(sData, srcCharsets);
 		}
 
-		bool bConverted = false;
+		srcCharsets.insert(srcCharsets.end(), vsFrom.begin(), vsFrom.end());
 
 		// try all possible source charsets:
-		for(VCString::const_iterator itf = vsFrom.begin(); itf != vsFrom.end(); ++itf)
+		for(VCString::const_iterator itf = srcCharsets.begin(); itf != srcCharsets.end(); ++itf)
 		{
 			if(ConvertCharset(*itf, sTo, sDataCopy))
 			{
@@ -170,25 +103,79 @@ private:
 		return bConverted;
 	}
 
+	bool OpenCharsetDetector(void)
+	{
+		UErrorCode uErr = U_ZERO_ERROR;
+		m_pCharsetDetector = ucsdet_open(&uErr);
+
+		return U_SUCCESS(uErr);
+	}
+
+	void CloseCharsetDetector(void)
+	{
+		if (m_pCharsetDetector)
+		{
+			ucsdet_close(m_pCharsetDetector);
+			m_pCharsetDetector = NULL;
+		}
+	}
+
+	bool CanConvertToUnicode(const CString& sCharset)
+	{
+		UConverter *conv;
+		UErrorCode uErr = U_ZERO_ERROR;
+
+		conv = ucnv_open(sCharset.c_str(), &uErr);
+
+		if(U_SUCCESS(uErr))
+		{
+			ucnv_close(conv);
+			return true;
+		}
+		else
+		{
+			return false;
+		}
+	}
+
 public:
 	MODCONSTRUCTOR(CCharsetMod)
 	{
-		m_bForce = false;
+		m_bGuess = false;
+		m_bOnlyServer = false;
+		m_pCharsetDetector = NULL;
+	}
+
+	virtual ~CCharsetMod()
+	{
+		CloseCharsetDetector();
 	}
 
 	bool OnLoad(const CString& sArgs, CString& sMessage)
 	{
 		size_t uIndex = 0;
 
-		if(sArgs.Token(0).Equals("-force"))
+		if(sArgs.Token(uIndex).Equals("-guess"))
 		{
-			m_bForce = true;
+			if(!OpenCharsetDetector())
+			{
+				sMessage = "Could not open charset detector.";
+				return false;
+			}
+
+			m_bGuess = true;
+			++uIndex;
+		}
+
+		if(sArgs.Token(uIndex).Equals("-onlyserver"))
+		{
+			m_bOnlyServer = true;
 			++uIndex;
 		}
 
 		if(sArgs.Token(uIndex + 1).empty() || !sArgs.Token(uIndex + 2).empty())
 		{
-			sMessage = "This module needs two charset lists as arguments: [-force] "
+			sMessage = "This module needs two charset lists as arguments: [-guess] [-onlyserver] "
 				"<client_charset1[,client_charset2[,...]]> "
 				"<server_charset1[,server_charset2[,...]]>";
 			return false;
@@ -205,21 +192,17 @@ public:
 		{
 			for(VCString::const_iterator itt = vsTo.begin(); itt != vsTo.end(); ++itt)
 			{
-				iconv_t icTest = iconv_open(itt->c_str(), itf->c_str());
-				if(icTest == (iconv_t)-1)
+				if(!CanConvertToUnicode(*itf))
 				{
-					sMessage = "Conversion from '" + *itf + "' to '" + *itt + "' is not possible.";
+					sMessage = "Cannot convert '" + *itf + "'.";
 					return false;
 				}
-				iconv_close(icTest);
 
-				icTest = iconv_open(itf->c_str(), itt->c_str());
-				if(icTest == (iconv_t)-1)
+				if(!CanConvertToUnicode(*itt))
 				{
-					sMessage = "Conversion from '" + *itt + "' to '" + *itf + "' is not possible.";
+					sMessage = "Cannot convert '" + *itt + "'.";
 					return false;
 				}
-				iconv_close(icTest);
 			}
 		}
 
@@ -239,16 +222,21 @@ public:
 	EModRet OnUserRaw(CString& sLine)
 	{
 		// convert client -> IRC server
-		ConvertCharset(m_vsClientCharsets, m_vsServerCharsets[0], sLine);
+		if(!m_bOnlyServer)
+		{
+			ConvertCharset(m_vsClientCharsets, m_vsServerCharsets[0], sLine);
+		}
+
 		return CONTINUE;
 	}
+
 };
 
 template<> void TModInfo<CCharsetMod>(CModInfo& Info)
 {
 	Info.SetWikiPage("charset");
 	Info.SetHasArgs(true);
-	Info.SetArgsHelpText("Two charset lists: [-force] "
+	Info.SetArgsHelpText("Two charset lists: [-guess] [-onlyserver] "
 						 "<client_charset1[,client_charset2[,...]]> "
 						 "<server_charset1[,server_charset2[,...]]>");
 }

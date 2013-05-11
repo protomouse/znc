@@ -91,7 +91,8 @@ cyrusauthLDFLAGS := -lsasl2
 ifeq "@CHARSET@" ""
 FILES    := $(shell echo $(FILES) | sed -e "s:charset::")
 endif
-charsetLDFLAGS := @LIBICONV@
+charsetCXXFLAGS := @icu_CFLAGS@
+charsetLDFLAGS := @icu_LIBS@
 
 TARGETS  := $(addsuffix .so, $(FILES))
 

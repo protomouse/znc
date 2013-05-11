@@ -95,6 +95,9 @@ PKG_PROG_PKG_CONFIG()
 AC_ARG_WITH( [openssl],
 	AS_HELP_STRING([--with-openssl=DIR], [openssl installation prefix]),
 	[OPENSSL=$withval],)
+AC_ARG_WITH( [icu],
+	AS_HELP_STRING([--with-icu=DIR], [icu installation prefix]),
+	[ICU=$withval],)
 AC_ARG_ENABLE( [debug],
 	AS_HELP_STRING([--enable-debug], [enable debugging]),
 	[DEBUG="$enableval"],
@@ -540,29 +543,12 @@ then
 fi
 
 CHARSET=""
-AC_CHECK_FUNC( iconv, CHARSET=1 )
-AC_CHECK_LIB( iconv, iconv_open, LIBICONV=-liconv ; CHARSET=1 )
-if test "x$CHARSET" = "x1"
-then
-	AC_MSG_CHECKING([whether iconv expects a const second argument])
-	AC_COMPILE_IFELSE([
-		AC_LANG_PROGRAM([[
-	#include <iconv.h>
-	]], [[
-		const char input[] = "X"; const char *inptr = input; size_t inbytes = 1;
-		char buf[1]; char *outptr = buf; size_t outbytes = 1;
-		iconv_t ic = iconv_open("ISO8859-1", "UTF8");
-		iconv(ic, (char**)&inptr, &inbytes, &outptr, &outbytes);
-	]])], [
-		AC_MSG_RESULT([no])
-		appendMod -DICONV_CONST=
-	], [
-		AC_MSG_RESULT([yes])
-		appendMod -DICONV_CONST=const
-	])
-else
-	AC_MSG_WARN([libiconv was not found, disabling the charset module])
+if test -n "$ICU"; then
+	export PKG_CONFIG_PATH="$ICU/lib/pkgconfig/:$ICU/lib64/pkgconfig/:$PKG_CONFIG_PATH"
 fi
+PKG_CHECK_MODULES([icu], [icu-uc icu-i18n], [CHARSET=1], [
+	AC_MSG_WARN([icu was not found, disabling the charset module])
+])
 
 AC_CACHE_CHECK([for GNU make], [ac_cv_path_GNUMAKE], [
 	AC_PATH_PROGS_FEATURE_CHECK([GNUMAKE], [make gmake], [[
@@ -589,7 +575,8 @@ AC_SUBST([NOSSL])
 AC_SUBST([TCL_FLAGS])
 AC_SUBST([CYRUS])
 AC_SUBST([CHARSET])
-AC_SUBST([LIBICONV])
+AC_SUBST([icu_CFLAGS])
+AC_SUBST([icu_LIBS])
 AC_SUBST([MODDIR])
 AC_SUBST([DATADIR])
 AC_SUBST([PERL])
